@@ -41,3 +41,174 @@ li.done .dot{background:var(--early);border-color:var(--early);color:#fff}
 li.target .dot{background:var(--glow);border-color:var(--glow);color:#06202b}
 .nm{font-weight:600}
 .pin{background:var(--ink);color:var(--bg);width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font:700 11px system-ui;border:2px solid var(--glow)}
+.me{width:16px;height:16px;border-radius:50%;background:var(--glow);border:3px solid #fff;box-shadow:0 0 0 6px rgba(25,195,230,.3)}
+label.t{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--mute)}
+@media(prefers-reduced-motion:no-preference){.me{animation:p 2s infinite}@keyframes p{50%{box-shadow:0 0 0 12px rgba(25,195,230,.1)}}}
+</style>
+</head>
+<body>
+<header><h1>Ravij’s Goa drive</h1><div class="tabs" id="tabs"></div></header>
+<div id="map" role="application" aria-label="Map of your route"></div>
+<main>
+  <section class="card" id="hero" aria-live="polite"></section>
+  <section class="card"><ul id="list"></ul></section>
+  <section class="card">
+    <div class="row" style="margin:0">
+      <button class="btn" id="center">Centre on me</button>
+      <button class="btn" id="reset">Reset day</button>
+    </div>
+    <label class="t" style="margin-top:10px"><input type="checkbox" id="sim"> Test mode: tap the map to set a pretend location</label>
+    <p class="mute" style="margin:10px 0 0">Times use today’s clock against the plan for the day you pick, so you can rehearse before Nov 13. Arrival is detected within 250 m of a stop. ETA uses your recent speed (40 km/h if unknown) on straight-line distance × 1.35, so treat it as a close estimate. Stop coordinates are approximate; tap “I’m here” if the app misses one. Route lines are straight, not roads.</p>
+  </section>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// ---- Trip data (a = planned arrival, d = planned departure) ----
+const DAYS={
+1:{label:"Day 1 · Nov 13",stops:[
+ {id:"1a",name:"Leave Belagavi",lat:15.8497,lng:74.4977,a:"06:00",d:"06:00",note:"NH 748 to Khanapur and Anmod"},
+ {id:"1b",name:"Anmod Ghat descent",lat:15.3830,lat2:0,lng:74.2610,a:"07:30",d:"07:35",note:"Misty ghat road into Goa"},
+ {id:"1c",name:"Dudhsagar viewpoint",lat:15.3350,lng:74.2930,a:"08:00",d:"08:30",note:"10 min distant view, no jeep safari"},
+ {id:"1d",name:"Tambdi Surla Mahadev Temple",lat:15.4375,lng:74.2600,a:"08:45",d:"10:15",note:"12th-century basalt temple, breakfast outside"},
+ {id:"1e",name:"Old Goa cathedrals",lat:15.5009,lng:73.9116,a:"11:30",d:"13:30",note:"Basilica of Bom Jesus and Se Cathedral"},
+ {id:"1f",name:"Lunch at The Verandah / Kokni Kanteen",lat:15.5030,lng:73.9130,a:"13:30",d:"14:30",note:"Fish thali"},
+ {id:"1g",name:"Vasco da Gama hotel",lat:15.3982,lng:73.8113,a:"15:00",d:"17:00",note:"Check in and rest"},
+ {id:"1h",name:"Bogmalo Beach sunset",lat:15.3650,lng:73.8330,a:"17:30",d:"19:00",note:"Tea at a beachfront cafe"},
+ {id:"1i",name:"Betalbatim Beach glow",lat:15.3040,lng:73.9150,a:"21:30",d:"23:30",note:"Walk to the dark stretch, stomp the wet sand"}
+]},
+2:{label:"Day 2 · Nov 14",stops:[
+ {id:"2a",name:"Vasco breakfast and check-out",lat:15.3982,lng:73.8113,a:"08:30",d:"09:30",note:"Then drive south"},
+ {id:"2b",name:"Cabo de Rama Fort",lat:15.0883,lng:73.9202,a:"10:30",d:"12:00",note:"Cliff views over the Arabian Sea"},
+ {id:"2c",name:"Palolem Beach and lunch",lat:15.0100,lng:74.0230,a:"12:30",d:"15:00",note:"Dolphin boat ride or shack lunch"},
+ {id:"2d",name:"Salaulim Dam, Sanguem",lat:15.1950,lng:74.1180,a:"16:15",d:"17:15",note:"Duckbill spillway vortex"},
+ {id:"2e",name:"Harvalem Falls and caves",lat:15.5975,lng:74.0127,a:"18:15",d:"19:00",note:"6th-century rock-cut caves"},
+ {id:"2f",name:"Chorla Ghat climb",lat:15.6350,lng:74.1500,a:"19:30",d:"19:45",note:"Roadside pull-out, listen to the falls"},
+ {id:"2g",name:"Home in Belagavi",lat:15.8497,lng:74.4977,a:"22:30",d:"22:30",note:"Late night arrival (estimated)"}
+]}};
+
+// ---- State ----
+const KEY="ravij-goa-v1";
+let S={day:1,log:{}};
+try{S=Object.assign(S,JSON.parse(localStorage.getItem(KEY)||"{}"))}catch(e){}
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}};
+let pos=null,trail=[],tracking=false,watchId=null,simOn=false,focusId=null;
+
+// ---- Helpers ----
+const $=s=>document.querySelector(s);
+const at=hhmm=>{const [h,m]=hhmm.split(":").map(Number),d=new Date();d.setHours(h,m,0,0);return d.getTime()};
+const hm=ms=>new Date(ms).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+const mins=ms=>Math.round(ms/60000);
+const dur=m=>{m=Math.abs(Math.round(m));return m>=60?`${Math.floor(m/60)} h ${String(m%60).padStart(2,"0")} min`:`${m} min`};
+function hav(a,b,c,d){const R=6371,r=x=>x*Math.PI/180,dl=r(c-a),dn=r(d-b);const q=Math.sin(dl/2)**2+Math.cos(r(a))*Math.cos(r(c))*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(q))}
+function delta(diffMs){const m=mins(diffMs);if(Math.abs(m)<=2)return{t:"On time",c:"ontime"};return m<0?{t:dur(m)+" early",c:"early"}:{t:dur(m)+" late",c:"late"}}
+const stops=()=>DAYS[S.day].stops;
+const L_=id=>S.log[id]||(S.log[id]={});
+const target=()=>stops().find(s=>!L_(s.id).dep&&!L_(s.id).skip);
+
+function speedKmh(){
+  const now=Date.now();trail=trail.filter(p=>now-p.t<180000);
+  if(trail.length>=2){const f=trail[0],l=trail[trail.length-1],h=(l.t-f.t)/3.6e6;
+    if(h>0){const v=hav(f.lat,f.lng,l.lat,l.lng)/h;if(v>15)return Math.min(v,70)}}
+  if(pos&&pos.speed>4)return Math.min(pos.speed*3.6,70);
+  return 40;
+}
+
+// ---- Map ----
+const map=L.map("map",{zoomControl:true}).setView([15.45,74.0],9);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribution:"© OpenStreetMap contributors"}).addTo(map);
+let layer=L.layerGroup().addTo(map),meMarker=null,accCircle=null;
+function drawMap(fit){
+  layer.clearLayers();const ss=stops();
+  L.polyline(ss.map(s=>[s.lat,s.lng]),{color:"#19C3E6",weight:3,dashArray:"6 8"}).addTo(layer);
+  ss.forEach((s,i)=>L.marker([s.lat,s.lng],{icon:L.divIcon({className:"",html:`<div class="pin">${i+1}</div>`,iconSize:[24,24]})}).bindPopup(`<b>${s.name}</b><br>${s.a}–${s.d}`).addTo(layer));
+  if(fit)map.fitBounds(ss.map(s=>[s.lat,s.lng]),{padding:[24,24]});
+}
+function setPos(lat,lng,acc,speed){
+  pos={lat,lng,acc:acc||30,speed:speed||0,t:Date.now()};trail.push(pos);
+  if(!meMarker){meMarker=L.marker([lat,lng],{icon:L.divIcon({className:"",html:'<div class="me"></div>',iconSize:[16,16]}),zIndexOffset:999}).addTo(map);accCircle=L.circle([lat,lng],{radius:pos.acc,color:"#19C3E6",weight:1,fillOpacity:.08}).addTo(map)}
+  else{meMarker.setLatLng([lat,lng]);accCircle.setLatLng([lat,lng]).setRadius(pos.acc)}
+  autoDetect();render();
+}
+map.on("click",e=>{if(simOn)setPos(e.latlng.lat,e.latlng.lng,10,0)});
+
+// ---- Tracking ----
+let wl=null;
+async function startTracking(){
+  if(!navigator.geolocation){alert("This browser does not support location.");return}
+  tracking=true;
+  try{wl=await navigator.wakeLock?.request("screen")}catch(e){}
+  watchId=navigator.geolocation.watchPosition(p=>{if(!simOn)setPos(p.coords.latitude,p.coords.longitude,p.coords.accuracy,p.coords.speed)},
+    err=>{tracking=false;$("#hero").dataset.err=err.code===1?"Location is blocked. Allow location for this site in your browser settings, then tap Start tracking.":"Can’t get a location fix. Move to open sky and try again.";render()},
+    {enableHighAccuracy:true,maximumAge:5000,timeout:20000});
+  render();
+}
+function autoDetect(){
+  if(!pos)return;const t=target();if(!t)return;const l=L_(t.id),d=hav(pos.lat,pos.lng,t.lat,t.lng)*1000;
+  if(!l.arr&&d<=250){l.arr=Date.now();save()}
+  else if(l.arr&&!l.dep&&d>450&&Date.now()-l.arr>60000){l.dep=Date.now();save()}
+}
+
+// ---- Render ----
+function render(){
+  const ss=stops(),t=target(),now=Date.now(),h=$("#hero");
+  let html="";
+  if(!tracking&&!simOn){
+    html=`<div class="mute">${h.dataset.err||"Start tracking to see whether you’re early or late."}</div><div class="row"><button class="btn pri" id="go">Start tracking</button></div>`;
+  }else if(!t){
+    html=`<div class="big early">Day complete</div><div class="mute">All stops done. Nice drive, Ravij.</div>`;
+  }else{
+    const l=L_(t.id),i=ss.indexOf(t),pa=at(t.a),pd=at(t.d),plan=mins(pd-pa);
+    if(l.arr){
+      const arrD=delta(l.arr-pa),spent=mins(now-l.arr),left=plan-spent;
+      html=`<div class="mute">At stop ${i+1} of ${ss.length}</div><div class="nm" style="font-size:18px">${t.name}</div>
+      <div class="big ${left<0?"late":"early"}">${plan===0?"Moving on":left>=0?dur(left)+" left":dur(left)+" over"}</div>
+      <div class="mute">Spent ${dur(spent)} of ${plan} min planned</div>
+      <div class="kv"><div><b>Arrived</b>${hm(l.arr)} · ${arrD.t}</div><div><b>Plan says leave</b>${hm(pd)}</div>
+      <div><b>Leave by to stay on plan</b>${hm(pd+Math.max(0,l.arr-pa))}</div><div><b>Note</b>${t.note}</div></div>
+      <div class="row"><button class="btn pri" data-a="leave">Leave now</button></div>`;
+    }else if(pos){
+      const km=hav(pos.lat,pos.lng,t.lat,t.lng),v=speedKmh(),travel=km*1.35/v*3600000,eta=now+travel,dl=delta(eta-pa);
+      html=`<div class="mute">Next: stop ${i+1} of ${ss.length}</div><div class="nm" style="font-size:18px">${t.name}</div>
+      <div class="big ${dl.c}">${dl.t}</div>
+      <div class="mute">vs planned arrival ${hm(pa)}</div>
+      <div class="kv"><div><b>ETA</b>${hm(eta)}</div><div><b>Distance</b>${km.toFixed(1)} km (${Math.round(v)} km/h)</div>
+      <div><b>Plan to stay</b>${plan} min (until ${hm(pd)})</div><div><b>Note</b>${t.note}</div></div>
+      <div class="row"><button class="btn pri" data-a="arrive">I’m here</button><button class="btn" data-a="skip">Skip stop</button></div>`;
+    }else html=`<div class="mute">Waiting for your first location fix…</div>`;
+  }
+  h.innerHTML=html;
+  $("#list").innerHTML=ss.map((s,i)=>{
+    const l=L_(s.id),pa=at(s.a),pd=at(s.d),plan=mins(pd-pa);let st;
+    if(l.skip)st="Skipped";
+    else if(l.dep||l.arr){const dl=delta(l.arr-pa);st=`Arrived ${hm(l.arr)} (${dl.t})`+(l.dep?` · stayed ${dur(mins(l.dep-l.arr))} of ${plan} min`:" · here now")}
+    else st=`${s.a}–${s.d} · stay ${plan} min`;
+    return `<li tabindex="0" data-id="${s.id}" class="${l.dep||l.skip?"done":""} ${t&&t.id===s.id?"target":""}"><div class="dot">${l.dep?"✓":i+1}</div><div><div class="nm">${s.name}</div><div class="mute">${st}</div></div></li>`;
+  }).join("");
+}
+
+// ---- Events ----
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-a],#go,li");if(!b)return;const t=target();
+  if(b.id==="go"){startTracking();return}
+  if(b.tagName==="LI"){const s=stops().find(x=>x.id===b.dataset.id);map.flyTo([s.lat,s.lng],13);return}
+  if(!t)return;const l=L_(t.id),a=b.dataset.a;
+  if(a==="arrive")l.arr=Date.now();
+  if(a==="leave"){l.dep=Date.now()}
+  if(a==="skip")l.skip=true;
+  save();render();
+});
+$("#center").onclick=()=>pos&&map.flyTo([pos.lat,pos.lng],14);
+$("#reset").onclick=()=>{if(confirm("Clear arrival and departure records for this day?")){stops().forEach(s=>delete S.log[s.id]);save();render()}};
+$("#sim").onchange=e=>{simOn=e.target.checked;if(simOn)render()};
+function tabs(){
+  $("#tabs").innerHTML=Object.entries(DAYS).map(([k,v])=>`<button aria-pressed="${S.day==k}" data-day="${k}">${v.label.split(" · ")[0]}</button>`).join("");
+}
+$("#tabs").onclick=e=>{const d=e.target.dataset.day;if(!d)return;S.day=+d;save();tabs();drawMap(true);render()};
+document.addEventListener("visibilitychange",async()=>{if(tracking&&document.visibilityState==="visible"){try{wl=await navigator.wakeLock?.request("screen")}catch(e){}}});
+
+tabs();drawMap(true);render();
+setInterval(render,1000);
+</script>
+</body>
+</html>
