@@ -58,7 +58,7 @@ label.t{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--mute)
       <button class="btn" id="reset">Reset day</button>
     </div>
     <label class="t" style="margin-top:10px"><input type="checkbox" id="sim"> Test mode: tap the map to set a pretend location</label>
-    <p class="mute" style="margin:10px 0 0">Times use today’s clock against the plan for the day you pick, so you can rehearse before Nov 13. Arrival is detected within 250 m of a stop. ETA uses your recent speed (40 km/h if unknown) on straight-line distance × 1.35, so treat it as a close estimate. Stop coordinates are approximate; tap “I’m here” if the app misses one. Route lines are straight, not roads.</p>
+    <p class="mute" style="margin:10px 0 0">Times use today’s clock against the plan for the day you pick, so you can rehearse before Nov 13. Arrival is detected within 250 m of a stop. Routes and ETAs come from OpenStreetMap road data (OSRM), with 10% added for ghat and traffic slowdowns. If routing can’t load, it falls back to a speed-based estimate. Stop coordinates are approximate; tap “I’m here” if the app misses one. Stop pins are snapped to the nearest road.</p><p class="mute" id="roadnote" style="margin:6px 0 0"></p>
   </section>
 </main>
 
@@ -68,7 +68,7 @@ label.t{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--mute)
 const DAYS={
 1:{label:"Day 1 · Nov 13",stops:[
  {id:"1a",name:"Leave Belagavi",lat:15.8497,lng:74.4977,a:"06:00",d:"06:00",note:"NH 748 to Khanapur and Anmod"},
- {id:"1b",name:"Anmod Ghat descent",lat:15.3830,lat2:0,lng:74.2610,a:"07:30",d:"07:35",note:"Misty ghat road into Goa"},
+ {id:"1b",name:"Anmod Ghat descent",lat:15.3830,lng:74.2610,a:"07:30",d:"07:35",note:"Misty ghat road into Goa"},
  {id:"1c",name:"Dudhsagar viewpoint",lat:15.3350,lng:74.2930,a:"08:00",d:"08:30",note:"10 min distant view, no jeep safari"},
  {id:"1d",name:"Tambdi Surla Mahadev Temple",lat:15.4375,lng:74.2600,a:"08:45",d:"10:15",note:"12th-century basalt temple, breakfast outside"},
  {id:"1e",name:"Old Goa cathedrals",lat:15.5009,lng:73.9116,a:"11:30",d:"13:30",note:"Basilica of Bom Jesus and Se Cathedral"},
@@ -120,15 +120,55 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:18,attribu
 let layer=L.layerGroup().addTo(map),meMarker=null,accCircle=null;
 function drawMap(fit){
   layer.clearLayers();const ss=stops();
-  L.polyline(ss.map(s=>[s.lat,s.lng]),{color:"#19C3E6",weight:3,dashArray:"6 8"}).addTo(layer);
   ss.forEach((s,i)=>L.marker([s.lat,s.lng],{icon:L.divIcon({className:"",html:`<div class="pin">${i+1}</div>`,iconSize:[24,24]})}).bindPopup(`<b>${s.name}</b><br>${s.a}–${s.d}`).addTo(layer));
   if(fit)map.fitBounds(ss.map(s=>[s.lat,s.lng]),{padding:[24,24]});
+  loadRoad();
+}
+
+// ---- Real road routing (free OSRM demo server, OpenStreetMap data) ----
+const roadLayer=L.layerGroup().addTo(map),liveLayer=L.layerGroup().addTo(map);
+const legs={},live={id:null,t:0,pos:null,dur:null,dist:null,busy:false};
+let routeCache={};try{routeCache=JSON.parse(localStorage.getItem("ravij-routes-v1")||"{}")}catch(e){}
+async function osrm(pts){
+  const c=pts.map(p=>p[1].toFixed(5)+","+p[0].toFixed(5)).join(";");
+  const r=await fetch("https://router.project-osrm.org/route/v1/driving/"+c+"?overview=full&geometries=geojson");
+  const j=await r.json();if(j.code!=="Ok")throw new Error(j.code);return j.routes[0];
+}
+async function loadRoad(){
+  const day=S.day,ss=stops(),key=day+":"+ss.map(s=>s.lat+","+s.lng).join("|");
+  roadLayer.clearLayers();liveLayer.clearLayers();live.id=null;
+  let rt=routeCache[key];
+  if(!rt){
+    try{const r=await osrm(ss.map(s=>[s.lat,s.lng]));
+      rt={g:r.geometry.coordinates.map(c=>[+c[1].toFixed(5),+c[0].toFixed(5)]),legs:r.legs.map(l=>[l.duration,l.distance])};
+      routeCache={};routeCache[key]=rt;try{localStorage.setItem("ravij-routes-v1",JSON.stringify(routeCache))}catch(e){}
+    }catch(e){rt=null}
+  }
+  if(day!==S.day)return;
+  roadLayer.clearLayers();
+  if(rt){L.polyline(rt.g,{color:"#1B6FA8",weight:5,opacity:.85}).addTo(roadLayer);legs[day]=rt.legs}
+  else{L.polyline(ss.map(s=>[s.lat,s.lng]),{color:"#19C3E6",weight:3,dashArray:"6 8"}).addTo(roadLayer);delete legs[day];
+    $("#roadnote").textContent="Road routing is unavailable right now (needs internet). Showing straight lines and rough estimates."}
+  if(rt)$("#roadnote").textContent="";
+  render();
+}
+async function updateLive(){
+  const t=target();if(!pos||!t||L_(t.id).arr||live.busy)return;
+  const moved=live.pos?hav(pos.lat,pos.lng,live.pos.lat,live.pos.lng)*1000:1e9;
+  if(live.id===t.id&&Date.now()-live.t<30000&&moved<300)return;
+  live.busy=true;const from={lat:pos.lat,lng:pos.lng};
+  try{
+    const r=await osrm([[from.lat,from.lng],[t.lat,t.lng]]);
+    live.dur=r.duration;live.dist=r.distance;
+    liveLayer.clearLayers();L.polyline(r.geometry.coordinates.map(c=>[c[1],c[0]]),{color:"#19C3E6",weight:7,opacity:.9}).addTo(liveLayer);
+  }catch(e){live.dur=null;live.dist=null}
+  live.id=t.id;live.t=Date.now();live.pos=from;live.busy=false;render();
 }
 function setPos(lat,lng,acc,speed){
   pos={lat,lng,acc:acc||30,speed:speed||0,t:Date.now()};trail.push(pos);
   if(!meMarker){meMarker=L.marker([lat,lng],{icon:L.divIcon({className:"",html:'<div class="me"></div>',iconSize:[16,16]}),zIndexOffset:999}).addTo(map);accCircle=L.circle([lat,lng],{radius:pos.acc,color:"#19C3E6",weight:1,fillOpacity:.08}).addTo(map)}
   else{meMarker.setLatLng([lat,lng]);accCircle.setLatLng([lat,lng]).setRadius(pos.acc)}
-  autoDetect();render();
+  autoDetect();updateLive();render();
 }
 map.on("click",e=>{if(simOn)setPos(e.latlng.lat,e.latlng.lng,10,0)});
 
@@ -168,11 +208,15 @@ function render(){
       <div><b>Leave by to stay on plan</b>${hm(pd+Math.max(0,l.arr-pa))}</div><div><b>Note</b>${t.note}</div></div>
       <div class="row"><button class="btn pri" data-a="leave">Leave now</button></div>`;
     }else if(pos){
-      const km=hav(pos.lat,pos.lng,t.lat,t.lng),v=speedKmh(),travel=km*1.35/v*3600000,eta=now+travel,dl=delta(eta-pa);
+      const road=live.id===t.id&&live.dur!=null;
+      let km,travel,how;
+      if(road){km=live.dist/1000;travel=Math.max(0,live.dur*1.1*1000-(now-live.t));how="by road"}
+      else{km=hav(pos.lat,pos.lng,t.lat,t.lng)*1.35;travel=km/speedKmh()*3600000;how="estimate"}
+      const eta=now+travel,dl=delta(eta-pa);
       html=`<div class="mute">Next: stop ${i+1} of ${ss.length}</div><div class="nm" style="font-size:18px">${t.name}</div>
       <div class="big ${dl.c}">${dl.t}</div>
       <div class="mute">vs planned arrival ${hm(pa)}</div>
-      <div class="kv"><div><b>ETA</b>${hm(eta)}</div><div><b>Distance</b>${km.toFixed(1)} km (${Math.round(v)} km/h)</div>
+      <div class="kv"><div><b>ETA</b>${hm(eta)}</div><div><b>Distance (${how})</b>${km.toFixed(1)} km · ${dur(travel/60000)}</div>
       <div><b>Plan to stay</b>${plan} min (until ${hm(pd)})</div><div><b>Note</b>${t.note}</div></div>
       <div class="row"><button class="btn pri" data-a="arrive">I’m here</button><button class="btn" data-a="skip">Skip stop</button></div>`;
     }else html=`<div class="mute">Waiting for your first location fix…</div>`;
@@ -183,7 +227,8 @@ function render(){
     if(l.skip)st="Skipped";
     else if(l.dep||l.arr){const dl=delta(l.arr-pa);st=`Arrived ${hm(l.arr)} (${dl.t})`+(l.dep?` · stayed ${dur(mins(l.dep-l.arr))} of ${plan} min`:" · here now")}
     else st=`${s.a}–${s.d} · stay ${plan} min`;
-    return `<li tabindex="0" data-id="${s.id}" class="${l.dep||l.skip?"done":""} ${t&&t.id===s.id?"target":""}"><div class="dot">${l.dep?"✓":i+1}</div><div><div class="nm">${s.name}</div><div class="mute">${st}</div></div></li>`;
+    const lg=legs[S.day]&&i>0?`<div class="mute">${dur(legs[S.day][i-1][0]*1.1/60)} · ${(legs[S.day][i-1][1]/1000).toFixed(0)} km drive from previous stop</div>`:"";
+    return `<li tabindex="0" data-id="${s.id}" class="${l.dep||l.skip?"done":""} ${t&&t.id===s.id?"target":""}"><div class="dot">${l.dep?"✓":i+1}</div><div><div class="nm">${s.name}</div><div class="mute">${st}</div>${lg}</div></li>`;
   }).join("");
 }
 
@@ -208,7 +253,7 @@ $("#tabs").onclick=e=>{const d=e.target.dataset.day;if(!d)return;S.day=+d;save()
 document.addEventListener("visibilitychange",async()=>{if(tracking&&document.visibilityState==="visible"){try{wl=await navigator.wakeLock?.request("screen")}catch(e){}}});
 
 tabs();drawMap(true);render();
-setInterval(render,1000);
+setInterval(()=>{updateLive();render()},1000);
 </script>
 </body>
 </html>
